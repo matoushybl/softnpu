@@ -31,7 +31,7 @@ use softnpu_client::cli::get_styles;
 use softnpu_client::config::{Config, Port};
 use std::fs::read_to_string;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -122,7 +122,7 @@ struct Stats {
     rx_bytes: AtomicU64,
     tx_pkts: AtomicU64,
     rx_err: AtomicU64,
-    /// Frames dropped because a transmit queue was full.
+    /// TX queue send failures (queue disconnected).
     tx_dropped: AtomicU64,
     /// Number of times the blocking recv returned (one "wakeup").
     wakeups: AtomicU64,
@@ -210,22 +210,19 @@ fn init_logger() -> Logger {
     slog::Logger::root(drain, slog::o!())
 }
 
-/// Enqueue a fully-built frame for the transmit thread to send. Never blocks:
-/// if the queue is full the frame is dropped (and counted).
+/// Enqueue a fully-built frame for the transmit thread to send. Blocks when
+/// the queue is full so a slow TX handler backpressures the receive path.
 fn enqueue(
     sender: &SyncSender<Vec<u8>>,
     buf: Vec<u8>,
     stats: &Stats,
     log: &Logger,
 ) {
-    match sender.try_send(buf) {
-        Ok(()) => {}
-        Err(TrySendError::Full(_)) => {
-            stats.tx_dropped.fetch_add(1, Ordering::Relaxed);
-        }
-        Err(TrySendError::Disconnected(_)) => {
-            warn!(log, "tx queue disconnected");
-        }
+    // Blocking send: backpressure through the receive thread (and hence the
+    // DLPI stream) is preferable to silently dropping frames.
+    if sender.send(buf).is_err() {
+        stats.tx_dropped.fetch_add(1, Ordering::Relaxed);
+        warn!(log, "tx queue disconnected");
     }
 }
 
@@ -490,16 +487,12 @@ fn recv_loop<F>(
             .block_ns
             .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
         stats.wakeups.fetch_add(1, Ordering::Relaxed);
-        // Test hook: if this file exists, skip the pipeline (recv-only rate).
-        let bypass = std::path::Path::new("/softnpu/softnpu.drop").exists();
 
         let mut batch = 0u64;
         stats.rx_pkts.fetch_add(1, Ordering::Relaxed);
         stats.rx_bytes.fetch_add(n as u64, Ordering::Relaxed);
         let h0 = Instant::now();
-        if !bypass {
-            handle(&msg[..n]);
-        }
+        handle(&msg[..n]);
         stats
             .handle_ns
             .fetch_add(h0.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -524,9 +517,7 @@ fn recv_loop<F>(
             stats.rx_pkts.fetch_add(1, Ordering::Relaxed);
             stats.rx_bytes.fetch_add(n as u64, Ordering::Relaxed);
             let h0 = Instant::now();
-            if !bypass {
-                handle(&msg[..n]);
-            }
+            handle(&msg[..n]);
             stats
                 .handle_ns
                 .fetch_add(h0.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -660,7 +651,7 @@ async fn run(log: Logger) -> Result<()> {
         // ingress handler: sidecar rx -> pipeline -> tx queue
         let sw_ = sw.clone();
         let txq_ = txq.clone();
-        let pipe_ = pipe.clone();
+        let pipe_ = pipelines[2 * index].clone();
         let stats_ = stats.clone();
         let log_ = log.clone();
         let dh = port.sidecar;
@@ -681,7 +672,7 @@ async fn run(log: Logger) -> Result<()> {
         // egress handler: scrimlet rx -> pipeline -> tx queue
         let sw_ = sw.clone();
         let txq_ = txq.clone();
-        let pipe_ = pipe.clone();
+        let pipe_ = pipelines[2 * index + 1].clone();
         let stats_ = stats.clone();
         let log_ = log.clone();
         let dh = port.scrimlet;
@@ -733,13 +724,30 @@ async fn run(log: Logger) -> Result<()> {
                 Err(_) => continue,
             };
 
-        softnpu::handle_management_message(
-            msg,
-            &pipe,
-            &uds,
-            client.as_ref(),
-            config.ports.len(),
-        )
-        .await;
+        match &msg {
+            softnpu::ManagementRequest::TableAdd(_)
+            | softnpu::ManagementRequest::TableRemove(_) => {
+                for p in pipelines.iter() {
+                    softnpu::handle_management_message(
+                        msg.clone(),
+                        p,
+                        &uds,
+                        client.as_ref(),
+                        config.ports.len(),
+                    )
+                    .await;
+                }
+            }
+            _ => {
+                softnpu::handle_management_message(
+                    msg,
+                    &pipelines[0],
+                    &uds,
+                    client.as_ref(),
+                    config.ports.len(),
+                )
+                .await;
+            }
+        }
     }
 }
