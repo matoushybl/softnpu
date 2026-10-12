@@ -12,7 +12,7 @@ use tokio::net::UnixDatagram;
 // Re-export p4rs so consumers can rely on matching types
 pub use p4rs;
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub enum ManagementRequest {
     #[default]
     RadixRequest,
@@ -27,7 +27,7 @@ pub enum ManagementResponse {
     DumpResponse(BTreeMap<String, Vec<TableEntry>>),
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TableAdd {
     pub table: String,
     pub action: String,
@@ -35,7 +35,7 @@ pub struct TableAdd {
     pub parameter_data: Vec<u8>,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TableRemove {
     pub table: String,
     pub keyset_data: Vec<u8>,
