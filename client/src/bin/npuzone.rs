@@ -236,7 +236,11 @@ async fn fetch_scadm_url(
 }
 
 fn runtime_dir(name: &str) -> String {
-    format!("/var/run/softnpu/{}", name)
+    // Persistent (rpool-backed) so the softnpu zone's lofs-mounted /softnpu
+    // survives host reboots: the zone's binaries/toml/snapshots are the
+    // scrimlet-equivalent of M.2 contents and must live on disk, not tmpfs.
+    // Was /var/run/softnpu (tmpfs) which made autoboot fail verify at boot.
+    format!("/var/softnpu/{}", name)
 }
 
 async fn fetch_sidecar_lite(
@@ -286,6 +290,33 @@ async fn fetch_artifact(
 ) -> anyhow::Result<()> {
     let mut easy = Easy::new();
     let name = name.to_owned();
+
+    // Local override: if a fork-built artifact is present in the
+    // fork-image dir, install it unconditionally and skip buildomat
+    // entirely. This lets a (non-buildomat) fork softnpu/
+    // sidecar-lite ride the standard `npu create sidecar` provisioning so
+    // the zone is born with the fork binaries (no post-boot swaps, no
+    // switch reprogramming dance). The dir is persistent (matches
+    // runtime_dir's /var/softnpu root) so staged fork artifacts also
+    // survive host reboots.
+    let fork_image = format!("/var/softnpu/fork-image/{}", filename);
+    if std::path::Path::new(&fork_image).exists() {
+        let dir = runtime_dir(&name);
+        std::fs::create_dir_all(&dir)?;
+        let mut src = std::fs::File::open(&fork_image)?;
+        let mut dst = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o755)
+            .open(format!("{}/{}", dir, filename))?;
+        std::io::copy(&mut src, &mut dst)?;
+        println!(
+            "local override: installed {} from {}",
+            filename, fork_image
+        );
+        return Ok(());
+    }
 
     println!("remote url: {shasum_url}");
 
@@ -388,9 +419,19 @@ fn create_ports(
                 let external_ifx = host.to_string();
                 let internal_ifx = format!("{name}_shi{i}");
                 let scrimlet = internal_ifx.clone();
+                // Mirror the sidecar datalink's MAC onto the scrimlet-side simnet for
+                // the uplink (qsfp) port: the softnpu treats the MAC of its external
+                // datalink as its "local MAC" and drops external unicast frames sent
+                // to any other MAC. Sharing the MAC makes the link L2-transparent so
+                // the switch zone can announce/learn it normally.
+                let mac = if host.contains("qsfp") {
+                    Some(libnet::get_link(&LinkHandle::Name(sys.to_owned()))?.mac)
+                } else {
+                    None
+                };
                 resources
                     .ports
-                    .push(SimnetLink::new(&external_ifx, &internal_ifx)?);
+                    .push(SimnetLink::with_mac(&external_ifx, &internal_ifx, mac, None)?);
                 resources.user_supplied_ports.push(sys.to_owned());
                 let sidecar = sys.to_owned();
                 cfg.ports.push(config::Port {
@@ -517,6 +558,7 @@ fn create_softnpu_zone(
     )?;
     sleep(Duration::from_secs(3));
     copy_in_mgmt_script(name)?;
+    z.zexec("/usr/sbin/svccfg import /softnpu/manifest/softnpu.xml")?;
     z.wait_for_network()?;
     z.zexec("/softnpu/npu start")?;
     resources.zones.push(z);
@@ -550,26 +592,75 @@ fn create_host_zone(
 }
 
 fn copy_in_mgmt_script(name: &str) -> anyhow::Result<()> {
-    let path = format!("{}/npu", runtime_dir(name));
+    let dir = runtime_dir(name);
+    let path = format!("{}/npu", dir);
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .truncate(true)
         .write(true)
         .mode(0o755)
-        .open(path)
-        .unwrap();
+        .open(path)?;
     f.write_all(SOFTNPU_SCRIPT.as_bytes())?;
+
+    // In-zone SMF manifest so zone boot (autoboot) starts softnpu as a real
+    // service instead of relying on the one-shot zexec at create time.
+    // Without this, a booted zone has nobody to run the runtime.
+    let manifest_dir = format!("{}/manifest", dir);
+    std::fs::create_dir_all(&manifest_dir)?;
+    let manifest_path = format!("{}/softnpu.xml", manifest_dir);
+    let mut m = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(manifest_path)?;
+    m.write_all(SMF_MANIFEST.as_bytes())?;
     Ok(())
 }
+
+const SMF_MANIFEST: &str = r#"<?xml version="1.0"?>
+<!DOCTYPE service_bundle SYSTEM "/usr/share/lib/xml/dtd/service_bundle.dtd.1">
+<service_bundle type="manifest" name="softnpu">
+  <service name="oxide/softnpu" type="service" version="1">
+    <create_default_instance enabled="true"/>
+    <single_instance/>
+    <dependency name="filesystem" grouping="require_all" restart_on="error"
+      type="service">
+      <service_fmri value="svc:/system/filesystem/minimal"/>
+    </dependency>
+    <dependency name="network" grouping="require_any" restart_on="error"
+      type="service">
+      <service_fmri value="svc:/network/service"/>
+    </dependency>
+    <exec_method type="method" name="start"
+      exec="/softnpu/npu start" timeout_seconds="60"/>
+    <exec_method type="method" name="stop"
+      exec="/softnpu/npu stop" timeout_seconds="60"/>
+    <property_group name="startd" type="framework">
+      <propval name="duration" type="astring" value="contract"/>
+      <propval name="ignore_error" type="astring" value="core,signal"/>
+    </property_group>
+    <stability value="Evolving"/>
+    <template>
+      <common_name>
+        <loctext xml:lang="C">Softnpu packet processor</loctext>
+      </common_name>
+    </template>
+  </service>
+</service_bundle>
+"#;
+
 
 const SOFTNPU_SCRIPT: &str = "#!/bin/bash
 
 case $1 in
     start) 
-        /softnpu/softnpu \
-            --uds-path /softnpu \
-            /softnpu/softnpu.toml \
-            &> /var/log/softnpu.log \
+        if pgrep -f softnpu.bin > /dev/null 2>&1; then
+            exit 0
+        fi
+        /softnpu/softnpu \\
+            --uds-path /softnpu \\
+            /softnpu/softnpu.toml \\
+            &> /var/log/softnpu.log \\
             &
         ;;
     stop)
